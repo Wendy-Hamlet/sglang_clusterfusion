@@ -1581,6 +1581,12 @@ class ModelRunner:
             )
 
             return DualChunkFlashAttentionBackend(self)
+        elif backend_str == "clusterfusion":
+            from sglang.srt.layers.attention.clusterfusion_backend import (
+                ClusterFusionAttnBackend,
+            )
+
+            return ClusterFusionAttnBackend(self)
         else:
             raise ValueError(f"Invalid attention backend: {backend_str}")
 
