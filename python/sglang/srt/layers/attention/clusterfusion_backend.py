@@ -9,6 +9,7 @@ from sglang.global_config import global_config
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
@@ -19,6 +20,7 @@ from sglang.srt.utils import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 if is_flashinfer_available():
@@ -26,6 +28,7 @@ if is_flashinfer_available():
         BatchPrefillWithPagedKVCacheWrapper,
         BatchPrefillWithRaggedKVCacheWrapper,
     )
+    from flashinfer.cascade import merge_state
 
 class WrapperDispatch(Enum):
     SLIDING_WINDOW = auto()
@@ -425,6 +428,90 @@ class ClusterFusionAttnBackend(AttentionBackend):
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
+    
+    def forward_extend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache=True,
+    ):
+        prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
+            self._get_wrapper_idx(layer)
+        ]
+        cache_loc = (
+            forward_batch.out_cache_loc
+            if not layer.is_cross_attention
+            else forward_batch.encoder_out_cache_loc
+        )
+
+        logits_soft_cap = layer.logit_cap
+
+        q = q.contiguous()
+        if not self.forward_metadata.use_ragged:
+            if k is not None:
+                assert v is not None
+                if save_kv_cache:
+                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                    )
+
+            o = prefill_wrapper_paged.forward(
+                q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                causal=not layer.is_cross_attention,
+                sm_scale=layer.scaling,
+                window_left=layer.sliding_window_size,
+                logits_soft_cap=logits_soft_cap,
+                k_scale=layer.k_scale,
+                v_scale=layer.v_scale,
+            )
+        else:
+            causal = True
+            if layer.attn_type == AttentionType.ENCODER_ONLY:
+                save_kv_cache = False
+                causal = False
+
+            if self.forward_metadata.extend_no_prefix:
+                # NOTE: FlashInfer currently has limitations with head_dim = 32 or other dimensions
+                # The FlashInfer head_dim limitation itself is tracked here:
+                # https://github.com/flashinfer-ai/flashinfer/issues/1048
+                o = self.prefill_wrapper_ragged.forward(
+                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k.view(-1, layer.tp_k_head_num, layer.head_dim),
+                    v.view(-1, layer.tp_v_head_num, layer.head_dim),
+                    causal=causal,
+                    sm_scale=layer.scaling,
+                    logits_soft_cap=logits_soft_cap,
+                )
+
+            else:
+                o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
+                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k.view(-1, layer.tp_k_head_num, layer.head_dim),
+                    v.view(-1, layer.tp_v_head_num, layer.head_dim),
+                    causal=True,
+                    sm_scale=layer.scaling,
+                    logits_soft_cap=logits_soft_cap,
+                )
+                o2, s2 = prefill_wrapper_paged.forward_return_lse(
+                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                    forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                    causal=False,
+                    sm_scale=layer.scaling,
+                    logits_soft_cap=logits_soft_cap,
+                )
+
+                o, _ = merge_state(o1, s1, o2, s2)
+
+            if save_kv_cache:
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                )
+
+        return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
 
 
