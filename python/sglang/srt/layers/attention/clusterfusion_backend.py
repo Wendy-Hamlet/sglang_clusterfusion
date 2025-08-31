@@ -512,6 +512,12 @@ class ClusterFusionAttnBackend(AttentionBackend):
                 )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+    
+    # TODO: implement forward_decode
+    def forward_decode(
+        
+    ):
+        """ClusterFusion"""
 
 
 
