@@ -30,6 +30,8 @@ if is_flashinfer_available():
     )
     from flashinfer.cascade import merge_state
 
+from clusterfusion import BatchDecodeWithPagedKVCacheWrapper
+
 class WrapperDispatch(Enum):
     SLIDING_WINDOW = auto()
     CROSS_ATTENTION = auto()
@@ -83,6 +85,14 @@ class ClusterFusionAttnBackend(AttentionBackend):
         else:
             self.num_wrappers = 1
             self.dispatch_reason = None
+        
+        # Qwen2/Qwen3 models require higher flashinfer workspace size
+        if (
+            "Qwen2ForCausalLM" in model_runner.model_config.hf_config.architectures
+            or "Qwen3ForCausalLM" in model_runner.model_config.hf_config.architectures
+            or "MiMoForCausalLM" in model_runner.model_config.hf_config.architectures
+        ):
+            global_config.flashinfer_workspace_size = 512 * 1024 * 1024
         
         # Allocate buffers
         global global_workspace_buffer
